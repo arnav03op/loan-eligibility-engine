@@ -1,0 +1,63 @@
+{
+  "id": "loanEngineWfZ001",
+  "name": "Z · Runtime check",
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "nodes": [
+    {
+      "id": "f0000000-0000-4000-8000-000000000001",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "parameters": {}
+    },
+    {
+      "id": "f0000000-0000-4000-8000-000000000002",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 0],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "id": "f1", "name": "gemini_model", "value": "={{ $env.GEMINI_MODEL }}", "type": "string" },
+            { "id": "f2", "name": "secret_configured", "value": "={{ Boolean($env.WEBHOOK_SECRET) }}", "type": "boolean" },
+            { "id": "f3", "name": "test_inbox_count", "value": "={{ String($env.TEST_INBOX_ALIASES || '').split(',').filter(a => a.trim()).length }}", "type": "number" }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "f0000000-0000-4000-8000-000000000003",
+      "name": "HMAC of shared vector",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [440, 0],
+      "parameters": {
+        "action": "hmac",
+        "type": "SHA256",
+        "value": "1700000000.123e4567-e89b-42d3-a456-426614174000",
+        "dataPropertyName": "expected_hmac",
+        "secret": "s3cr3t",
+        "encoding": "hex"
+      }
+    },
+    {
+      "id": "f0000000-0000-4000-8000-000000000004",
+      "name": "Runtime check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0],
+      "parameters": { "jsCode": "@@code:z_runtime_check.js" }
+    }
+  ],
+  "connections": {
+    "Run manually": { "main": [[{ "node": "Config", "type": "main", "index": 0 }]] },
+    "Config": { "main": [[{ "node": "HMAC of shared vector", "type": "main", "index": 0 }]] },
+    "HMAC of shared vector": { "main": [[{ "node": "Runtime check", "type": "main", "index": 0 }]] }
+  }
+}

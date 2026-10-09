@@ -1,0 +1,10 @@
+[project]
+name = "loan-engine"
+version = "0.1.0"
+description = "Loan Eligibility Engine — ingestion Lambdas"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"

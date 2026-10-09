@@ -1,0 +1,45 @@
+{
+  "id": "loanEngineWfE001",
+  "name": "E · Error Alerts",
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "nodes": [
+    {
+      "id": "e0000000-0000-4000-8000-000000000001",
+      "name": "On workflow error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "parameters": {}
+    },
+    {
+      "id": "e0000000-0000-4000-8000-000000000002",
+      "name": "Format alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0],
+      "parameters": { "jsCode": "@@code:e_format_alert.js" }
+    },
+    {
+      "id": "e0000000-0000-4000-8000-000000000003",
+      "name": "Email admin",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "position": [440, 0],
+      "parameters": {
+        "operation": "send",
+        "isBodyHtml": true,
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.html }}",
+        "fromEmail": "={{ $env.SES_FROM }}",
+        "toAddresses": ["={{ $env.ADMIN_ALIAS }}"],
+        "additionalFields": {}
+      },
+      "credentials": { "aws": { "id": "loanEngAwsSes0001", "name": "Loan Engine AWS SES" } }
+    }
+  ],
+  "connections": {
+    "On workflow error": { "main": [[{ "node": "Format alert", "type": "main", "index": 0 }]] },
+    "Format alert": { "main": [[{ "node": "Email admin", "type": "main", "index": 0 }]] }
+  }
+}

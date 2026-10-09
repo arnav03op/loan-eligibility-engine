@@ -1,0 +1,280 @@
+# Loan Eligibility Engine — AWS resources (Serverless Framework v3).
+# Deploy with scripts/deploy.sh (it writes config/aws.generated.yml and builds the zip).
+service: loan-eligibility-engine
+frameworkVersion: '3'
+
+custom:
+  aws: ${file(./config/aws.generated.yml)}
+  uploadBucket: ${self:service}-${sls:stage}-${aws:accountId}-uploads
+  ssmPrefix: /loan-engine
+  dbName: loan_engine
+  dbUser: loan_admin
+  dbEnvironment:
+    DB_HOST: !GetAtt Database.Endpoint.Address
+    DB_PORT: !GetAtt Database.Endpoint.Port
+    DB_NAME: ${self:custom.dbName}
+    DB_USER: ${self:custom.dbUser}
+    DB_PASSWORD: ${ssm:${self:custom.ssmPrefix}/db-password}
+    DB_SSLMODE: verify-full
+    DB_SSLROOTCERT: /var/task/certs/rds-global-bundle.pem
+  vpc:
+    securityGroupIds:
+      - !GetAtt LambdaSecurityGroup.GroupId
+    subnetIds: ${self:custom.aws.subnetIds}
+  apiOrigin: !Join ['', ['https://', !Ref HttpApi, '.execute-api.', !Ref AWS::Region, '.amazonaws.com']]
+
+provider:
+  name: aws
+  runtime: python3.12
+  architecture: x86_64
+  region: ${opt:region, 'ap-south-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 15
+  logRetentionInDays: 7
+  environment:
+    UPLOAD_BUCKET: ${self:custom.uploadBucket}
+    MAX_UPLOAD_BYTES: '52428800'
+  httpApi:
+    payload: '2.0'
+  s3:
+    uploads:
+      name: ${self:custom.uploadBucket}
+      publicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      bucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      corsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST]
+            AllowedOrigins:
+              - ${self:custom.apiOrigin}
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+      lifecycleConfiguration:
+        Rules:
+          - Id: expire-uploads
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 7
+
+package:
+  artifact: build/lambda.zip
+
+functions:
+  ui:
+    handler: loan_engine.handlers.ui.handler
+    role: UiRole
+    events:
+      - httpApi: { method: GET, path: / }
+
+  presign:
+    handler: loan_engine.handlers.presign.handler
+    role: PresignRole
+    events:
+      - httpApi: { method: POST, path: /uploads }
+
+  status:
+    handler: loan_engine.handlers.status.handler
+    role: StatusRole
+    vpc: ${self:custom.vpc}
+    environment: ${self:custom.dbEnvironment}
+    events:
+      - httpApi: { method: GET, path: '/uploads/{batch_id}' }
+
+  ingest:
+    handler: loan_engine.handlers.ingest.handler
+    role: IngestRole
+    timeout: 300
+    memorySize: 512
+    maximumRetryAttempts: 1
+    vpc: ${self:custom.vpc}
+    environment: ${self:custom.dbEnvironment}
+    destinations:
+      onSuccess: notify
+    events:
+      - s3:
+          bucket: uploads
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: uploads/
+            - suffix: .csv
+
+  notify:
+    handler: loan_engine.handlers.notify.handler
+    role: NotifyRole
+    timeout: 60
+    environment:
+      WEBHOOK_URL_PARAM: ${self:custom.ssmPrefix}/n8n-webhook-url
+      WEBHOOK_SECRET_PARAM: ${self:custom.ssmPrefix}/webhook-secret
+
+resources:
+  Conditions:
+    CreateS3Endpoint: !Equals ['${self:custom.aws.createS3Endpoint}', 'true']
+
+  Resources:
+    # ---------- networking ----------
+    LambdaSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Loan engine Lambdas that connect to RDS
+        VpcId: ${self:custom.aws.vpcId}
+
+    DatabaseSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Loan engine RDS - only the Lambda SG and the operator IP
+        VpcId: ${self:custom.aws.vpcId}
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            CidrIp: ${self:custom.aws.operatorCidr}
+
+    # Lets the in-VPC ingest Lambda read S3 without a NAT Gateway (gateway endpoints are free).
+    S3GatewayEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Condition: CreateS3Endpoint
+      Properties:
+        VpcEndpointType: Gateway
+        VpcId: ${self:custom.aws.vpcId}
+        ServiceName: !Join ['', ['com.amazonaws.', !Ref AWS::Region, '.s3']]
+        RouteTableIds: ${self:custom.aws.routeTableIds}
+
+    # ---------- database ----------
+    DatabaseSubnetGroup:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupDescription: Loan engine database subnets (default VPC)
+        SubnetIds: ${self:custom.aws.subnetIds}
+
+    DatabaseParameterGroup:
+      Type: AWS::RDS::DBParameterGroup
+      Properties:
+        Description: Loan engine - require TLS
+        Family: postgres16
+        Parameters:
+          rds.force_ssl: '1'
+
+    Database:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        Engine: postgres
+        EngineVersion: '16'
+        DBInstanceClass: db.t4g.micro
+        AllocatedStorage: '20'
+        StorageType: gp3
+        DBName: ${self:custom.dbName}
+        MasterUsername: ${self:custom.dbUser}
+        MasterUserPassword: '{{resolve:ssm-secure:/loan-engine/db-password}}'
+        PubliclyAccessible: true
+        DBSubnetGroupName: !Ref DatabaseSubnetGroup
+        DBParameterGroupName: !Ref DatabaseParameterGroup
+        VPCSecurityGroups:
+          - !GetAtt DatabaseSecurityGroup.GroupId
+        BackupRetentionPeriod: 0
+        MultiAZ: false
+        DeletionProtection: false
+        AutoMinorVersionUpgrade: true
+
+    # ---------- least-privilege roles (one per function) ----------
+    UiRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: &lambdaTrust
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: { Service: lambda.amazonaws.com }
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+    PresignRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *lambdaTrust
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: presign-uploads
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: s3:PutObject
+                  Resource: arn:aws:s3:::${self:custom.uploadBucket}/uploads/*
+
+    StatusRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *lambdaTrust
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+    IngestRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *lambdaTrust
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        Policies:
+          - PolicyName: ingest
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: arn:aws:s3:::${self:custom.uploadBucket}/uploads/*
+                - Effect: Allow
+                  Action: lambda:InvokeFunction
+                  Resource: arn:aws:lambda:${aws:region}:${aws:accountId}:function:${self:service}-${sls:stage}-notify
+
+    NotifyRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *lambdaTrust
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: notify-read-params
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: ssm:GetParameter
+                  Resource: arn:aws:ssm:${aws:region}:${aws:accountId}:parameter/loan-engine/*
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: ssm.${aws:region}.amazonaws.com
+
+  extensions:
+    HttpApiStage:
+      Properties:
+        DefaultRouteSettings:
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+
+  Outputs:
+    ApiUrl:
+      Value: ${self:custom.apiOrigin}
+    DatabaseHost:
+      Value: !GetAtt Database.Endpoint.Address
+    UploadBucketName:
+      Value: ${self:custom.uploadBucket}
+    DatabaseSecurityGroupId:
+      Value: !GetAtt DatabaseSecurityGroup.GroupId

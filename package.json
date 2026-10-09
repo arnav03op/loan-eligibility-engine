@@ -1,0 +1,13 @@
+{
+  "name": "loan-eligibility-engine",
+  "private": true,
+  "description": "Loan Eligibility Engine — infrastructure and n8n Code-node libraries",
+  "scripts": {
+    "test:n8n": "node --test --test-concurrency=1 \"n8n/code/test/**/*.test.js\"",
+    "build:workflows": "python3 scripts/build-workflows.py"
+  },
+  "devDependencies": {
+    "pg": "^8.13.0",
+    "serverless": "^3.39.0"
+  }
+}

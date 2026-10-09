@@ -1,0 +1,21 @@
+# Secrets and local config
+.env
+n8n/.env
+n8n/credentials.env
+n8n/.import/*
+!n8n/.import/.gitkeep
+config/aws.generated.yml
+
+# Downloaded / generated artefacts
+certs/*.pem
+build/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node / Serverless
+node_modules/
+.serverless/

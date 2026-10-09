@@ -1,0 +1,58 @@
+# Local runtime for the Loan Eligibility Engine.
+#   docker compose up -d n8n                       # n8n on http://localhost:5678
+#   docker compose --profile tunnel up -d tunnel   # public URL for the AWS notify Lambda
+#   docker compose --profile dev up -d dev-db      # Postgres for tests and local development
+name: loan-engine
+
+services:
+  n8n:
+    image: n8nio/n8n:${N8N_VERSION:?set N8N_VERSION in n8n/.env}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5678:5678"          # never exposed on the LAN; public access only via the tunnel
+    env_file: .env
+    environment:
+      GENERIC_TIMEZONE: Asia/Kolkata
+      TZ: Asia/Kolkata
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"   # lets expressions read $env (Config nodes)
+      NODE_OPTIONS: --max-old-space-size=2048
+      NODE_EXTRA_CA_CERTS: /certs/rds-global-bundle.pem   # verify RDS TLS
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "168"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/import/workflows:ro
+      - ./.import:/import/credentials:ro
+      - ../certs:/certs:ro
+
+  tunnel:
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-latest}
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://n8n:5678
+    depends_on:
+      - n8n
+
+  dev-db:
+    image: postgres:16-alpine
+    profiles: ["dev"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:55432:5432"
+    environment:
+      POSTGRES_USER: loan
+      POSTGRES_PASSWORD: loan
+      POSTGRES_DB: loan_engine
+    volumes:
+      - dev_db_data:/var/lib/postgresql/data
+      - ./dev-db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loan -d loan_engine"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  n8n_data:
+  dev_db_data:

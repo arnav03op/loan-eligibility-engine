@@ -1,0 +1,293 @@
+{
+  "id": "loanEngineWfB001",
+  "name": "B · User-Loan Matching",
+  "active": false,
+  "settings": { "executionOrder": "v1", "errorWorkflow": "loanEngineWfE001", "timezone": "Asia/Kolkata" },
+  "nodes": [
+    {
+      "id": "b0000000-0000-4000-8000-000000000001",
+      "name": "Webhook: batch ingested",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 100],
+      "webhookId": "b0000000-0000-4000-8000-0000000000aa",
+      "parameters": { "httpMethod": "POST", "path": "loan-match", "responseMode": "responseNode", "options": {} }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000002",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 100],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "id": "b2000000-0000-4000-8000-000000000001", "name": "llm_max_calls", "value": "={{ Number($env.LLM_MAX_CALLS || 20) }}", "type": "number" },
+            { "id": "b2000000-0000-4000-8000-000000000002", "name": "secret_configured", "value": "={{ Boolean($env.WEBHOOK_SECRET) }}", "type": "boolean" }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000003",
+      "name": "Expected signature",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [440, 100],
+      "parameters": {
+        "action": "hmac",
+        "type": "SHA256",
+        "value": "={{ ($json.headers['x-timestamp'] ?? '') + '.' + ($json.body?.batch_id ?? '') }}",
+        "dataPropertyName": "expected_signature",
+        "secret": "={{ $env.WEBHOOK_SECRET }}",
+        "encoding": "hex"
+      }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000004",
+      "name": "Verify signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 100],
+      "parameters": { "jsCode": "@@code:b_verify_signature.js" }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000005",
+      "name": "Signature valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [880, 100],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "b1000000-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000006",
+      "name": "Reject 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1100, 260],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ error: $json.reason }) }}",
+        "options": { "responseCode": 401 }
+      }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000007",
+      "name": "Accept 202",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1100, 0],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ accepted: true, batch_id: $json.batch_id }) }}",
+        "options": { "responseCode": 202 }
+      }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000008",
+      "name": "Build query SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 0],
+      "parameters": { "jsCode": "@@code:b_build_query_sql.js" }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000009",
+      "name": "Fetch active products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1540, 0],
+      "parameters": { "operation": "executeQuery", "query": "={{ $json.products_sql }}", "options": {} },
+      "credentials": { "postgres": { "id": "loanEngPostgres01", "name": "Loan Engine Postgres" } }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000010",
+      "name": "Stage 1: SQL pre-filter",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1760, 0],
+      "parameters": { "operation": "executeQuery", "query": "={{ $('Build query SQL').first().json.stage1_sql }}", "options": {} },
+      "credentials": { "postgres": { "id": "loanEngPostgres01", "name": "Loan Engine Postgres" } }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000011",
+      "name": "Stage 2: rules & scoring",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 0],
+      "parameters": { "jsCode": "@@code:b_stage2.js" }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000012",
+      "name": "LLM cache lookup",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2200, 0],
+      "parameters": { "operation": "executeQuery", "query": "={{ $json.cache_sql }}", "options": {} },
+      "credentials": { "postgres": { "id": "loanEngPostgres01", "name": "Loan Engine Postgres" } }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000013",
+      "name": "Stage 3a: plan LLM work",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2420, 0],
+      "parameters": { "jsCode": "@@code:b_plan_llm.js" }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000014",
+      "name": "Needs LLM?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2640, 0],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "b1000000-0000-4000-8000-000000000002",
+              "leftValue": "={{ $json.needs_llm }}",
+              "rightValue": "",
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000015",
+      "name": "One item per LLM batch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2860, -120],
+      "parameters": { "jsCode": "@@code:b_explode_batches.js" }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000016",
+      "name": "Gemini: judge borderline",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3080, -120],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://generativelanguage.googleapis.com/v1beta/models/' + ($env.GEMINI_MODEL || 'gemini-3.5-flash-lite') + ':generateContent' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.gemini_request) }}",
+        "options": { "timeout": 120000, "batching": { "batch": { "batchSize": 1, "batchInterval": 7000 } } }
+      },
+      "credentials": { "httpHeaderAuth": { "id": "loanEngGemini0001", "name": "Gemini API key" } }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000017",
+      "name": "Stage 3b: apply LLM verdicts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3300, -120],
+      "parameters": { "jsCode": "@@code:b_apply_llm.js" }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000018",
+      "name": "Persist matches & funnel stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [3520, 0],
+      "parameters": { "operation": "executeQuery", "query": "={{ $json.persist_sql }}", "options": {} },
+      "credentials": { "postgres": { "id": "loanEngPostgres01", "name": "Loan Engine Postgres" } }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000020",
+      "name": "Batch persisted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3740, 0],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "b1000000-0000-4000-8000-000000000003",
+              "leftValue": "={{ $json.batch_id }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b0000000-0000-4000-8000-000000000019",
+      "name": "Trigger notifications (Workflow C)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [3960, -60],
+      "parameters": {
+        "source": "database",
+        "workflowId": { "__rl": true, "value": "loanEngineWfC001", "mode": "id" },
+        "options": { "waitForSubWorkflow": false }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: batch ingested": { "main": [[{ "node": "Config", "type": "main", "index": 0 }]] },
+    "Config": { "main": [[{ "node": "Expected signature", "type": "main", "index": 0 }]] },
+    "Expected signature": { "main": [[{ "node": "Verify signature", "type": "main", "index": 0 }]] },
+    "Verify signature": { "main": [[{ "node": "Signature valid?", "type": "main", "index": 0 }]] },
+    "Signature valid?": {
+      "main": [
+        [{ "node": "Accept 202", "type": "main", "index": 0 }],
+        [{ "node": "Reject 401", "type": "main", "index": 0 }]
+      ]
+    },
+    "Accept 202": { "main": [[{ "node": "Build query SQL", "type": "main", "index": 0 }]] },
+    "Build query SQL": { "main": [[{ "node": "Fetch active products", "type": "main", "index": 0 }]] },
+    "Fetch active products": { "main": [[{ "node": "Stage 1: SQL pre-filter", "type": "main", "index": 0 }]] },
+    "Stage 1: SQL pre-filter": { "main": [[{ "node": "Stage 2: rules & scoring", "type": "main", "index": 0 }]] },
+    "Stage 2: rules & scoring": { "main": [[{ "node": "LLM cache lookup", "type": "main", "index": 0 }]] },
+    "LLM cache lookup": { "main": [[{ "node": "Stage 3a: plan LLM work", "type": "main", "index": 0 }]] },
+    "Stage 3a: plan LLM work": { "main": [[{ "node": "Needs LLM?", "type": "main", "index": 0 }]] },
+    "Needs LLM?": {
+      "main": [
+        [{ "node": "One item per LLM batch", "type": "main", "index": 0 }],
+        [{ "node": "Persist matches & funnel stats", "type": "main", "index": 0 }]
+      ]
+    },
+    "One item per LLM batch": { "main": [[{ "node": "Gemini: judge borderline", "type": "main", "index": 0 }]] },
+    "Gemini: judge borderline": { "main": [[{ "node": "Stage 3b: apply LLM verdicts", "type": "main", "index": 0 }]] },
+    "Stage 3b: apply LLM verdicts": { "main": [[{ "node": "Persist matches & funnel stats", "type": "main", "index": 0 }]] },
+    "Persist matches & funnel stats": { "main": [[{ "node": "Batch persisted?", "type": "main", "index": 0 }]] },
+    "Batch persisted?": {
+      "main": [
+        [{ "node": "Trigger notifications (Workflow C)", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  }
+}

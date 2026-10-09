@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loan Eligibility Engine</title>
+  <style>
+    :root { --bg:#f6f7f9; --card:#fff; --text:#1d2433; --muted:#5b6475; --accent:#0b6bcb;
+            --ok:#1a7f37; --bad:#c62828; --border:#dde1e7; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg:#12151b; --card:#1b2029; --text:#e6e9ef; --muted:#9aa3b2; --accent:#4c9cf0;
+              --ok:#4cc26a; --bad:#ef6b6b; --border:#2c3340; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+           background: var(--bg); color: var(--text); }
+    main { max-width: 720px; margin: 0 auto; padding: 32px 16px; }
+    h1 { margin: 0 0 4px; font-size: 26px; }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+            padding: 20px; margin-top: 16px; }
+    #drop { border: 2px dashed var(--border); border-radius: 10px; padding: 32px 16px;
+            text-align: center; cursor: pointer; }
+    #drop.over, #drop:focus { border-color: var(--accent); outline: none; }
+    button { margin-top: 12px; background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+             padding: 10px 18px; font-size: 15px; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: default; }
+    progress { width: 100%; height: 10px; margin-top: 12px; }
+    ol.steps { list-style: none; padding: 0; margin: 0; }
+    ol.steps li { padding: 6px 0; color: var(--muted); }
+    ol.steps li::before { content: "○ "; }
+    ol.steps li.active { color: var(--text); font-weight: 600; }
+    ol.steps li.done { color: var(--ok); }
+    ol.steps li.done::before { content: "● "; }
+    ol.steps li.failed { color: var(--bad); }
+    table { width: 100%; border-collapse: collapse; }
+    td { padding: 6px 0; border-bottom: 1px solid var(--border); }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .error { color: var(--bad); }
+    code { font-size: 13px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Loan Eligibility Engine</h1>
+  <p class="muted">Upload a users CSV with columns user_id, name, email, monthly_income, credit_score,
+    employment_status, age. The file goes straight to S3; the pipeline then ingests it, matches users to
+    loan products and emails the results to the test inbox.</p>
+
+  <section class="card">
+    <div id="drop" tabindex="0" role="button" aria-label="Choose a CSV file">
+      <strong>Drop a CSV here</strong> or click to choose (max 50&nbsp;MB)
+      <input id="file" type="file" accept=".csv,text/csv" hidden>
+    </div>
+    <p id="chosen" class="muted"></p>
+    <button id="upload" disabled>Upload &amp; start pipeline</button>
+    <progress id="progress" max="100" value="0" hidden></progress>
+    <p id="message" role="status"></p>
+  </section>
+
+  <section class="card" id="status-card" hidden>
+    <h2>Pipeline status</h2>
+    <p class="muted">Batch <code id="batch-id"></code></p>
+    <ol class="steps">
+      <li data-step="uploaded">Uploaded to S3</li>
+      <li data-step="ingested">Ingested into PostgreSQL</li>
+      <li data-step="matched">Matched to loan products (n8n Workflow B)</li>
+      <li data-step="emailed">Notification emails sent (n8n Workflow C)</li>
+    </ol>
+  </section>
+
+  <section class="card" id="funnel-card" hidden>
+    <h2>Optimisation funnel</h2>
+    <table><tbody id="funnel"></tbody></table>
+  </section>
+</main>
+<script>
+  const REQUIRED = ['user_id', 'name', 'email', 'monthly_income', 'credit_score', 'employment_status', 'age'];
+  const MAX_BYTES = 50 * 1024 * 1024;
+  const POLL_MS = 2000;
+  const INGEST_TIMEOUT_MS = 5 * 60 * 1000;
+  const PIPELINE_TIMEOUT_MS = 15 * 60 * 1000;
+  const EMAIL_SETTLE_POLLS = 3;
+  const EMAIL_START_TIMEOUT_MS = 2 * 60 * 1000;
+  const el = (id) => document.getElementById(id);
+  const fmt = (n) => Number(n ?? 0).toLocaleString('en-IN');
+  let selected = null;
+
+  el('drop').addEventListener('click', () => el('file').click());
+  el('drop').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el('file').click(); }
+  });
+  el('drop').addEventListener('dragover', (e) => { e.preventDefault(); el('drop').classList.add('over'); });
+  el('drop').addEventListener('dragleave', () => el('drop').classList.remove('over'));
+  el('drop').addEventListener('drop', (e) => {
+    e.preventDefault(); el('drop').classList.remove('over'); choose(e.dataTransfer.files[0]);
+  });
+  el('file').addEventListener('change', (e) => choose(e.target.files[0]));
+  el('upload').addEventListener('click', start);
+
+  function say(text, isError = false) {
+    el('message').textContent = text;
+    el('message').className = isError ? 'error' : '';
+  }
+
+  async function choose(file) {
+    selected = null;
+    el('upload').disabled = true;
+    say('');
+    if (!file) return;
+    el('chosen').textContent = `${file.name} — ${(file.size / 1024 / 1024).toFixed(2)} MB`;
+    const problem = await checkFile(file);
+    if (problem) { say(problem, true); return; }
+    selected = file;
+    el('upload').disabled = false;
+  }
+
+  async function checkFile(file) {
+    if (!file.name.toLowerCase().endsWith('.csv')) return 'Please choose a .csv file.';
+    if (file.size === 0) return 'The file is empty.';
+    if (file.size > MAX_BYTES) return 'The file is larger than 50 MB.';
+    const head = await file.slice(0, 8192).text();
+    const header = head.replace(/^﻿/, '').split(/\r?\n/)[0]
+      .split(',').map((c) => c.trim().replace(/^"|"$/g, '').toLowerCase());
+    const missing = REQUIRED.filter((c) => !header.includes(c));
+    return missing.length ? `Missing column(s): ${missing.join(', ')}` : null;
+  }
+
+  async function start() {
+    el('upload').disabled = true;
+    try {
+      say('Requesting an upload URL…');
+      const res = await fetch('/uploads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: selected.name, size: selected.size }),
+      });
+      const presign = await res.json();
+      if (!res.ok) throw new Error(presign.error || `HTTP ${res.status}`);
+      say('Uploading to S3…');
+      await uploadToS3(presign, selected);
+      say('Upload complete — the pipeline is running.');
+      track(presign.batch_id);
+    } catch (err) {
+      say(`Upload failed: ${err.message}`, true);
+      el('upload').disabled = false;
+    }
+  }
+
+  function uploadToS3({ url, fields }, file) {
+    return new Promise((resolve, reject) => {
+      const form = new FormData();
+      Object.entries(fields).forEach(([k, v]) => form.append(k, v));
+      form.append('file', file); // S3 requires the file to be the last field
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url);
+      el('progress').hidden = false;
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) el('progress').value = (e.loaded / e.total) * 100; };
+      xhr.onload = () => (xhr.status >= 200 && xhr.status < 300)
+        ? resolve()
+        : reject(new Error(`S3 responded ${xhr.status}: ${xhr.responseText.slice(0, 200)}`));
+      xhr.onerror = () => reject(new Error('network error while uploading to S3'));
+      xhr.send(form);
+    });
+  }
+
+  function setStep(step, state, detail = '') {
+    const li = document.querySelector(`[data-step="${step}"]`);
+    li.dataset.label = li.dataset.label || li.textContent;
+    li.className = state;
+    li.textContent = detail ? `${li.dataset.label} — ${detail}` : li.dataset.label;
+  }
+
+  function track(batchId) {
+    el('status-card').hidden = false;
+    el('batch-id').textContent = batchId;
+    setStep('uploaded', 'done');
+    setStep('ingested', 'active', 'waiting for the ingest Lambda');
+    const startedAt = Date.now();
+    const timer = setInterval(poll, POLL_MS);
+    let matchSeenAt = null;
+    let lastEmails = -1;
+    let stablePolls = 0;
+
+    async function poll() {
+      const elapsed = Date.now() - startedAt;
+      try {
+        const res = await fetch(`/uploads/${batchId}`);
+        if (res.status === 404) {
+          if (elapsed > INGEST_TIMEOUT_MS) stop('Ingestion has not started after 5 minutes — check the ingest Lambda logs.');
+          return;
+        }
+        const s = await res.json();
+        if (!res.ok) throw new Error(s.error || `HTTP ${res.status}`);
+        render(s);
+        if (s.match_run && matchSeenAt === null) matchSeenAt = Date.now();
+        if (s.status === 'failed') stop(`Ingestion failed: ${s.error_message}`);
+        else if (s.status === 'processing' && elapsed > INGEST_TIMEOUT_MS) stop('Still ingesting after 5 minutes — check the ingest Lambda logs.');
+        else if (s.match_run && s.match_run.matches_inserted === 0) stop();
+        else if (s.match_run && s.emails_sent > 0 && settled(s.emails_sent)) stop();
+        else if (s.match_run && s.emails_sent === 0 && Date.now() - matchSeenAt > EMAIL_START_TIMEOUT_MS) stop('Matching finished but no emails were recorded after 2 minutes — check n8n Workflow C executions.');
+        else if (elapsed > PIPELINE_TIMEOUT_MS) stop('No result after 15 minutes — check n8n executions.');
+      } catch (err) {
+        say(`Status check failed: ${err.message}`, true);
+      }
+    }
+
+    // True once the email count has been unchanged for EMAIL_SETTLE_POLLS consecutive polls.
+    function settled(count) {
+      stablePolls = count === lastEmails ? stablePolls + 1 : 0;
+      lastEmails = count;
+      return stablePolls >= EMAIL_SETTLE_POLLS;
+    }
+
+    function stop(error) {
+      clearInterval(timer);
+      if (error) say(error, true); else say('Pipeline finished.');
+    }
+  }
+
+  function render(s) {
+    if (s.status === 'processing') setStep('ingested', 'active', 'ingesting');
+    if (s.status === 'failed') setStep('ingested', 'failed', s.error_message || 'failed');
+    if (s.status !== 'completed') return;
+    setStep('ingested', 'done', `${fmt(s.inserted_rows)} users stored, ${fmt(s.rejected_rows)} rows rejected`);
+    if (!s.match_run) { setStep('matched', 'active', 'waiting for n8n'); return; }
+    setStep('matched', 'done', `${fmt(s.match_run.matches_inserted)} matches`);
+    setStep('emailed', s.emails_sent > 0 ? 'done' : 'active', s.emails_sent > 0 ? `${s.emails_sent} sent` : 'sending');
+    renderFunnel(s.match_run);
+  }
+
+  function renderFunnel(r) {
+    const rows = [
+      ['All user × product pairs', r.pairs_total],
+      ['After SQL pre-filter (stage 1)', r.pairs_after_sql],
+      ['Accepted by rules (stage 2)', r.rules_accepted],
+      ['Rejected by rules (stage 2)', r.rules_rejected],
+      ['Borderline pairs (to stage 3)', r.borderline_pairs],
+      ['Unique profile-bucket × product questions', r.llm_buckets],
+      ['…answered from the LLM cache', r.llm_cache_hits],
+      ['LLM calls made', r.llm_calls],
+      ['Accepted by the LLM', r.llm_accepted],
+      ['Matches stored', r.matches_inserted],
+    ];
+    const body = el('funnel');
+    body.replaceChildren(...rows.map(([label, value]) => {
+      const tr = document.createElement('tr');
+      const name = document.createElement('td');
+      const num = document.createElement('td');
+      name.textContent = label;
+      num.textContent = fmt(value);
+      num.className = 'num';
+      tr.append(name, num);
+      return tr;
+    }));
+    el('funnel-card').hidden = false;
+  }
+</script>
+</body>
+</html>
